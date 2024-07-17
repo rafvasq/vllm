@@ -18,6 +18,7 @@ from starlette.routing import Mount
 import vllm.envs as envs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.entrypoints.grpc.grpc_server import start_grpc_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -34,6 +35,7 @@ from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from vllm.logger import init_logger
+from vllm.tgis_utils.args import add_tgis_args, postprocess_tgis_args
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import FlexibleArgumentParser
 from vllm.version import __version__ as VLLM_VERSION
@@ -46,6 +48,7 @@ engine_args: AsyncEngineArgs
 openai_serving_chat: OpenAIServingChat
 openai_serving_completion: OpenAIServingCompletion
 openai_serving_embedding: OpenAIServingEmbedding
+async_llm_engine: AsyncLLMEngine
 
 logger = init_logger('vllm.entrypoints.openai.api_server')
 
@@ -65,7 +68,14 @@ async def lifespan(app: fastapi.FastAPI):
         _running_tasks.add(task)
         task.add_done_callback(_running_tasks.remove)
 
+    grpc_server = await start_grpc_server(async_llm_engine, args)
+
     yield
+
+    logger.info("Gracefully stopping gRPC server")
+    await grpc_server.stop(30)  #TODO configurable grace
+    await grpc_server.wait_for_termination()
+    logger.info("gRPC server stopped")
 
 
 router = APIRouter()
@@ -220,6 +230,16 @@ def run_server(args, llm_engine=None):
     global engine, engine_args
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
+
+    # Enforce pixel values as image input type for vision language models
+    # when serving with API server
+    if engine_args.image_input_type is not None and \
+        engine_args.image_input_type.upper() != "PIXEL_VALUES":
+        raise ValueError(
+            f"Invalid image_input_type: {engine_args.image_input_type}. "
+            "Only --image-input-type 'pixel_values' is supported for serving "
+            "vision language models with the vLLM API server.")
+
     engine = (llm_engine
               if llm_engine is not None else AsyncLLMEngine.from_engine_args(
                   engine_args, usage_context=UsageContext.OPENAI_API_SERVER))
@@ -241,6 +261,7 @@ def run_server(args, llm_engine=None):
     global openai_serving_chat
     global openai_serving_completion
     global openai_serving_embedding
+    global async_llm_engine
 
     openai_serving_chat = OpenAIServingChat(engine, model_config,
                                             served_model_names,
@@ -252,6 +273,11 @@ def run_server(args, llm_engine=None):
         args.prompt_adapters)
     openai_serving_embedding = OpenAIServingEmbedding(engine, model_config,
                                                       served_model_names)
+
+    # 🌶️🌶️🌶️ Sets the engine for the TGIS gRPC server.
+    # Do not delete on merge conflicts!
+    async_llm_engine = engine
+
     app.root_path = args.root_path
 
     logger.info("Available routes are:")
@@ -278,5 +304,8 @@ if __name__ == "__main__":
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server.")
     parser = make_arg_parser(parser)
+    parser = add_tgis_args(parser)
     args = parser.parse_args()
+    args = postprocess_tgis_args(args)
+
     run_server(args)
